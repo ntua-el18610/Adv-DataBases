@@ -241,8 +241,8 @@ spark = SparkSession.builder.appName("Crime Analysis by Area with SQL").getOrCre
 # Start timing
 start_time = time.time()
 
-df_victims_1 = spark.read.parquet("s3://groups-bucket-dblab-905418150721/group18/q2/converted.parquet/part-00000-27e4dfc8-6ccb-4290-82ab-bbe5c9821eb9-c000.snappy.parquet")
-df_victims_2 = spark.read.parquet("s3://groups-bucket-dblab-905418150721/group18/q2/converted.parquet/part-00001-27e4dfc8-6ccb-4290-82ab-bbe5c9821eb9-c000.snappy.parquet")
+df_victims_1 = spark.read.parquet("s3://groups-bucket-dblab-905418150721/group18/q2/converted.parquet/part-00000-14dac44f-6bf2-4b81-9d06-5642aef8a91b-c000.snappy.parquet")
+df_victims_2 = spark.read.parquet("s3://groups-bucket-dblab-905418150721/group18/q2/converted.parquet/part-00001-14dac44f-6bf2-4b81-9d06-5642aef8a91b-c000.snappy.parquet")
 df_all_victims = df_victims_1.union(df_victims_2)
 
 
