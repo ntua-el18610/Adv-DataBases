@@ -1,0 +1,240 @@
+#2x4x8
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, avg, rank
+from pyspark.sql.window import Window
+from sedona.register import SedonaRegistrator
+from sedona.spark import *
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Number of Crimes Closest to Each Police Station") \
+    .config("spark.executor.instances", "2") \
+    .config("spark.executor.cores", "4") \
+    .config("spark.executor.memory", "8g") \
+    .getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# Create Sedona session
+sedona = SedonaContext.create(spark)
+SedonaRegistrator.registerAll(spark)
+
+# File paths
+la_stations_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_Police_Stations.csv"
+crime19_path = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crimepresent_path = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19_path, header=True, inferSchema=True).select("LAT", "LON")
+crimepresent_df = spark.read.csv(crimepresent_path, header=True, inferSchema=True).select("LAT", "LON")
+la_stations_df = spark.read.csv(la_stations_path, header=True, inferSchema=True).select("X", "Y", "DIVISION")
+
+# Combine crime datasets
+all_crimes_df = crime19_df.union(crimepresent_df)
+
+# Filter out coordinates (0,0) for crimes and police stations
+all_crimes_df = all_crimes_df.filter((col("LAT") != 0) & (col("LON") != 0))
+la_stations_df = la_stations_df.filter((col("X") != 0) & (col("Y") != 0))
+
+# Convert crimes to points
+all_crimes_df = all_crimes_df.withColumn(
+    "crime_geom",
+    ST_Point(col("LON"), col("LAT"))
+)
+
+# Convert police stations to points
+la_stations_df = la_stations_df.withColumn(
+    "station_geom",
+    ST_Point(col("X"), col("Y"))
+)
+
+# Perform a cross join and calculate distances
+joined_df = all_crimes_df.crossJoin(la_stations_df) \
+    .withColumn("distance_degrees", ST_Distance(col("crime_geom"), col("station_geom"))) \
+    .withColumn("distance_km", col("distance_degrees") * 111)  # Convert to kilometers
+
+# Find the closest station for each crime
+window_spec = Window.partitionBy("crime_geom").orderBy(col("distance_km").asc())
+
+# Add a column to identify the closest station
+closest_station_df = joined_df.withColumn("rank", rank().over(window_spec)) \
+    .filter(col("rank") == 1)
+
+# Count crimes per station and calculate average distance
+result_df = closest_station_df.groupBy("DIVISION") \
+    .agg(
+        count("*").alias("crime_count"),
+        avg("distance_km").alias("average_distance_km")  # Use distance in kilometers
+    ) \
+    .orderBy(col("crime_count").desc())
+
+# Show the result
+result_df.show(21, truncate=False)
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+
+#4x2x4
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, avg, rank
+from pyspark.sql.window import Window
+from sedona.register import SedonaRegistrator
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Number of Crimes Closest to Each Police Station") \
+    .config("spark.executor.instances", "4") \
+    .config("spark.executor.cores", "2") \
+    .config("spark.executor.memory", "4g") \
+    .getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# Create Sedona session
+sedona = SedonaContext.create(spark)
+SedonaRegistrator.registerAll(spark)
+
+# File paths
+la_stations_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_Police_Stations.csv"
+crime19_path = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crimepresent_path = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19_path, header=True, inferSchema=True).select("LAT", "LON")
+crimepresent_df = spark.read.csv(crimepresent_path, header=True, inferSchema=True).select("LAT", "LON")
+la_stations_df = spark.read.csv(la_stations_path, header=True, inferSchema=True).select("X", "Y", "DIVISION")
+
+# Combine crime datasets
+all_crimes_df = crime19_df.union(crimepresent_df)
+
+# Filter out coordinates (0,0) for crimes and police stations
+all_crimes_df = all_crimes_df.filter((col("LAT") != 0) & (col("LON") != 0))
+la_stations_df = la_stations_df.filter((col("X") != 0) & (col("Y") != 0))
+
+# Convert crimes to points
+all_crimes_df = all_crimes_df.withColumn(
+    "crime_geom",
+    ST_Point(col("LON"), col("LAT"))
+)
+
+# Convert police stations to points
+la_stations_df = la_stations_df.withColumn(
+    "station_geom",
+    ST_Point(col("X"), col("Y"))
+)
+
+# Perform a cross join and calculate distances
+joined_df = all_crimes_df.crossJoin(la_stations_df) \
+    .withColumn("distance_degrees", ST_Distance(col("crime_geom"), col("station_geom"))) \
+    .withColumn("distance_km", col("distance_degrees") * 111)  # Convert to kilometers
+
+# Find the closest station for each crime
+window_spec = Window.partitionBy("crime_geom").orderBy(col("distance_km").asc())
+
+# Add a column to identify the closest station
+closest_station_df = joined_df.withColumn("rank", rank().over(window_spec)) \
+    .filter(col("rank") == 1)
+
+# Count crimes per station and calculate average distance
+result_df = closest_station_df.groupBy("DIVISION") \
+    .agg(
+        count("*").alias("crime_count"),
+        avg("distance_km").alias("average_distance_km")  # Use distance in kilometers
+    ) \
+    .orderBy(col("crime_count").desc())
+
+# Show the result
+result_df.show(21, truncate=False)
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+
+#8x1x2 
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, avg, rank
+from pyspark.sql.window import Window
+from sedona.register import SedonaRegistrator
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Number of Crimes Closest to Each Police Station") \
+    .config("spark.executor.instances", "8") \
+    .config("spark.executor.cores", "1") \
+    .config("spark.executor.memory", "2g") \
+    .getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# Create Sedona session
+sedona = SedonaContext.create(spark)
+SedonaRegistrator.registerAll(spark)
+
+# File paths
+la_stations_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_Police_Stations.csv"
+crime19_path = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crimepresent_path = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19_path, header=True, inferSchema=True).select("LAT", "LON")
+crimepresent_df = spark.read.csv(crimepresent_path, header=True, inferSchema=True).select("LAT", "LON")
+la_stations_df = spark.read.csv(la_stations_path, header=True, inferSchema=True).select("X", "Y", "DIVISION")
+
+# Combine crime datasets
+all_crimes_df = crime19_df.union(crimepresent_df)
+
+# Filter out coordinates (0,0) for crimes and police stations
+all_crimes_df = all_crimes_df.filter((col("LAT") != 0) & (col("LON") != 0))
+la_stations_df = la_stations_df.filter((col("X") != 0) & (col("Y") != 0))
+
+# Convert crimes to points
+all_crimes_df = all_crimes_df.withColumn(
+    "crime_geom",
+    ST_Point(col("LON"), col("LAT"))
+)
+
+# Convert police stations to points
+la_stations_df = la_stations_df.withColumn(
+    "station_geom",
+    ST_Point(col("X"), col("Y"))
+)
+
+# Perform a cross join and calculate distances
+joined_df = all_crimes_df.crossJoin(la_stations_df) \
+    .withColumn("distance_degrees", ST_Distance(col("crime_geom"), col("station_geom"))) \
+    .withColumn("distance_km", col("distance_degrees") * 111)  # Convert to kilometers
+
+# Find the closest station for each crime
+window_spec = Window.partitionBy("crime_geom").orderBy(col("distance_km").asc())
+
+# Add a column to identify the closest station
+closest_station_df = joined_df.withColumn("rank", rank().over(window_spec)) \
+    .filter(col("rank") == 1)
+
+# Count crimes per station and calculate average distance
+result_df = closest_station_df.groupBy("DIVISION") \
+    .agg(
+        count("*").alias("crime_count"),
+        avg("distance_km").alias("average_distance_km")  # Use distance in kilometers
+    ) \
+    .orderBy(col("crime_count").desc())
+
+# Show the result
+result_df.show(21, truncate=False)
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
