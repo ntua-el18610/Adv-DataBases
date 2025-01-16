@@ -1,0 +1,66 @@
+import csv
+from pyspark.sql import SparkSession
+from io import StringIO
+import time
+
+# Initialize SparkSession
+spark = SparkSession \
+    .builder \
+    .appName("Crime Filter") \
+    .config("spark.executor.instances", "4") \
+    .config("spark.executor.cores", "2") \
+    .config("spark.executor.memory", "4g") \
+    .getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# Load the data
+victims19 = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv",
+    header=True, inferSchema=True
+)
+victims_current = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv",
+    header=True, inferSchema=True
+)
+
+# Combine the DataFrames
+all_victims = victims19.union(victims_current)
+all_victims_rdd = all_victims.rdd
+
+# Extract relevant columns: 'Vict Age', 'Vict Sex', and 'Crm Cd Desc' (assuming indices are 12, 11, and 9)
+# Also filter rows containing "AGGRAVATED ASSAULT" in 'Crm Cd Desc' and ensure Vict Age > 0
+filtered_data_rdd = all_victims_rdd.filter(
+    lambda row: "AGGRAVATED ASSAULT" in row['Crm Cd Desc'].upper() and row['Vict Age'] > 0
+).map(
+    lambda row: (row['Vict Age'], row['Vict Sex'], row['Crm Cd Desc'])  # Keep only relevant columns
+)
+
+# Sort the filtered data based on Vict Age
+sorted_data_rdd = filtered_data_rdd.sortBy(
+    lambda row: row[0]  # Sort by Vict Age
+)
+
+# Split the data into age groups
+under_18_rdd = sorted_data_rdd.filter(lambda row: row[0] < 18)
+age_18_to_24_rdd = sorted_data_rdd.filter(lambda row: 18 <= row[0] <= 24)
+age_25_to_64_rdd = sorted_data_rdd.filter(lambda row: 25 <= row[0] <= 64)
+above_64_rdd = sorted_data_rdd.filter(lambda row: row[0] > 64)
+
+# Display results for each group
+def show_results(rdd, group_name):
+    print(f"\n{group_name}:")
+    for row in rdd.take(20):
+        print(f"Vict Age: {row[0]}, Vict Sex: {row[1]}, Crm Cd Desc: {row[2]}")
+
+# Display results
+show_results(under_18_rdd, "Under 18")
+show_results(age_18_to_24_rdd, "18 to 24")
+show_results(age_25_to_64_rdd, "25 to 64")
+show_results(above_64_rdd, "Above 64")
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
