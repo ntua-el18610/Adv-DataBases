@@ -1,4 +1,4 @@
-#2x1x2
+#part 1 2x1x2
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, year, to_date, desc, asc, trim, lower, regexp_replace, udf,
@@ -183,7 +183,7 @@ end_time = time.time()
 elapsed_time = end_time - start_time
 print(f"Time taken: {elapsed_time:.2f} seconds")
 
-#2x2x4
+#part 2 2x2x4
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
@@ -371,7 +371,7 @@ end_time = time.time()
 elapsed_time = end_time - start_time
 print(f"Time taken: {elapsed_time:.2f} seconds")
 
-#2x4x8
+#part 3 2x4x8
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
