@@ -1,0 +1,560 @@
+#2x1x2
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, year, to_date, desc, asc, trim, lower, regexp_replace, udf,
+    sum as _sum, expr)
+from pyspark.sql.types import StringType
+from sedona.spark import *
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("3 top victim ethnicities of the poorest and richest communitys") \
+    .config("spark.executor.instances", "2") \
+    .config("spark.executor.cores", "1") \
+    .config("spark.executor.memory", "2g") \
+    .getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# create sedona session
+sedona = SedonaContext.create(spark)
+
+# File paths
+censusblocks = "s3a://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+la_income = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+crime19 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19, header=True, inferSchema=True).select("LAT", "LON")
+geojson_df = spark.read.json(censusblocks)
+income_df = spark.read.csv(la_income, header=True, inferSchema=True)
+
+
+blocks_df = sedona.read.format("geojson") \
+    .option("multiLine", "true").load(censusblocks) \
+    .selectExpr("explode(features) as features") \
+    .select("features.*")
+
+# Extract relevant columns and ensure geometry is in WKT format
+blocks_df = blocks_df.select(
+    col("properties.ZCTA10").alias("Block_ZCTA10"),
+    col("geometry").cast("string").alias("geometry"),
+    col("properties.*")
+)
+
+# Convert geometry from WKT using ST_GeomFromText()
+blocks_df = blocks_df.withColumn("geometry_polygon", ST_GeomFromText(col("geometry")))
+
+
+# Filter blocks where city = Los Angeles and select the values we need
+filtered_geojson_df = geojson_df \
+    .filter(
+        (col("properties.CITY") == "Los Angeles") & 
+        (col("properties.HOUSING10").cast("int") > 0) & 
+        (col("properties.POP_2010").cast("int") > 0)
+    ) \
+    .select(
+        trim(lower(col("properties.ZCTA10"))).alias("ZCTA10"),
+        col("properties.HOUSING10").alias("HOUSING10"),
+        col("properties.POP_2010").alias("POP_2010"),
+        col("properties.COMM").alias("COMM"),
+        col("geometry.coordinates").alias("coordinates"),
+        col("geometry.type").alias("geometrytype")
+    )
+
+# Select and clean relevant columns in income_df
+income_df = income_df \
+    .withColumn("Zip Code", trim(lower(col("Zip Code").cast("string")))) \
+    .withColumn(
+        "Estimated Median Income",
+        regexp_replace(col("Estimated Median Income"), "[^0-9.]+", "").cast("double")
+    )
+
+# Perform inner join to match ZCTA10 with Zip Code and find corresponding income
+joined_df = filtered_geojson_df.join(
+    income_df,
+    filtered_geojson_df["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).select(
+    filtered_geojson_df["ZCTA10"],
+    filtered_geojson_df["HOUSING10"],
+    filtered_geojson_df["POP_2010"],
+    filtered_geojson_df["COMM"],
+    income_df["Estimated Median Income"]
+)
+
+# add column with total salary per block
+joined_df = joined_df.withColumn(
+    "Total_Salary_Block",
+    col("Estimated Median Income") * col("HOUSING10")
+)
+
+
+# Aggregate total salary and population by COMM
+community_salary_df = joined_df.groupBy("COMM").agg(
+    _sum("Total_Salary_Block").alias("Total_Salary_Community"),
+    _sum("POP_2010").alias("Total_Pop_Community")
+)
+
+# Calculate average salary per person for each community
+final_community_df = community_salary_df.withColumn(
+    "Avg_Salary_Per_Person",
+    col("Total_Salary_Community") / col("Total_Pop_Community")
+)
+
+# Sort the results by Avg_Salary_Per_Person in descending order
+final_community_df_top = final_community_df.orderBy(
+    col("Avg_Salary_Per_Person").desc()
+)
+
+final_community_df_bot = final_community_df.orderBy(
+    col("Avg_Salary_Per_Person").asc()
+)
+# Collect the top 3 rows as a list of Row objects
+top_3_comms = final_community_df_top.limit(3).collect()
+bot_3_comms = final_community_df_bot.limit(3).collect()
+
+# Extract the COMM values and store them in separate variables
+tcomm1, tcomm2, tcomm3 = [row["COMM"] for row in top_3_comms]
+bcomm1, bcomm2, bcomm3 = [row["COMM"] for row in bot_3_comms]
+
+
+# Load crime data and filter for 2015
+crime_data = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv",
+    header=True,
+    inferSchema=True
+)
+
+# Convert "DATE OCC" to year and filter for 2015
+crime_data_filtered = crime_data.withColumn(
+    "Year", year(to_date(col("DATE OCC"), "MM/dd/yyyy hh:mm:ss a"))
+).filter(col("Year") == 2015)
+
+re_codes = spark.read.csv("s3://initial-notebook-data-bucket-dblab-905418150721/RE_codes.csv",
+                          header=True,
+                          inferSchema=True)
+
+crime_data_filtered = crime_data_filtered.filter(col("LAT").isNotNull() & col("LON").isNotNull())
+
+crime_data_filtered = crime_data_filtered.withColumn(
+    "LocationPoint", ST_Point(col("LON"), col("LAT"))
+)
+
+# Perform spatial join: Check if crime points are within polygons
+spatial_joined_df = crime_data_filtered.join(
+    blocks_df,
+    ST_Contains(col("geometry_polygon"), col("LocationPoint")),
+    "inner"
+)
+
+spatial_joined_df.createOrReplaceTempView("CrimeData")
+querytop = f"SELECT COMM, `Vict Descent` FROM CrimeData  WHERE COMM IN ('{tcomm1}', '{tcomm2}', '{tcomm3}')"
+querybot = f"SELECT COMM, `Vict Descent` FROM CrimeData  WHERE COMM IN ('{bcomm1}', '{bcomm2}', '{bcomm3}')"
+
+df_rich = spark.sql(querytop)
+df_poor = spark.sql(querybot)
+
+# Group by 'Vict Descent' and count occurrences
+df_rich_count = df_rich.groupBy('Vict Descent').count()
+df_poor_count = df_poor.groupBy('Vict Descent').count()
+
+# Show the result
+rich = df_rich_count.sort(desc("count")).limit(3)
+final_richest = rich.join(re_codes,
+                          re_codes["Vict Descent"] == rich["Vict Descent"],
+                          "inner").select(re_codes["Vict Descent Full"],
+                                          rich["count"]).sort(desc("count"))
+
+poor = df_poor_count.sort(desc("count")).limit(4)
+final_poorest = poor.join(re_codes,
+                          re_codes["Vict Descent"] == poor["Vict Descent"],
+                          "inner").select(re_codes["Vict Descent Full"],
+                                          poor["count"]).sort(desc("count"))
+
+# Show the final result
+final_richest.show()
+final_poorest.show()
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+
+#2x2x4
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, year, to_date, desc, asc, trim, lower, regexp_replace, udf,
+    sum as _sum, expr)
+from pyspark.sql.types import StringType
+from sedona.spark import *
+import time
+
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("3 top victim ethnicities of the poorest and richest communitys") \
+    .config("spark.executor.instances", "2") \
+    .config("spark.executor.cores", "2") \
+    .config("spark.executor.memory", "4g") \
+    .getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# create sedona session
+sedona = SedonaContext.create(spark)
+
+# File paths
+censusblocks = "s3a://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+la_income = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+crime19 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19, header=True, inferSchema=True).select("LAT", "LON")
+
+geojson_df = spark.read.json(censusblocks)
+income_df = spark.read.csv(la_income, header=True, inferSchema=True)
+
+
+blocks_df = sedona.read.format("geojson") \
+    .option("multiLine", "true").load(censusblocks) \
+    .selectExpr("explode(features) as features") \
+    .select("features.*")
+
+# Extract relevant columns and ensure geometry is in WKT format
+blocks_df = blocks_df.select(
+    col("properties.ZCTA10").alias("Block_ZCTA10"),
+    col("geometry").cast("string").alias("geometry"),
+    col("properties.*")
+)
+
+# Convert geometry from WKT using ST_GeomFromText()
+blocks_df = blocks_df.withColumn("geometry_polygon", ST_GeomFromText(col("geometry")))
+
+
+# Filter blocks where city = Los Angeles and select the values we need
+filtered_geojson_df = geojson_df \
+    .filter(
+        (col("properties.CITY") == "Los Angeles") & 
+        (col("properties.HOUSING10").cast("int") > 0) & 
+        (col("properties.POP_2010").cast("int") > 0)
+    ) \
+    .select(
+        trim(lower(col("properties.ZCTA10"))).alias("ZCTA10"),
+        col("properties.HOUSING10").alias("HOUSING10"),
+        col("properties.POP_2010").alias("POP_2010"),
+        col("properties.COMM").alias("COMM"),
+        col("geometry.coordinates").alias("coordinates"),
+        col("geometry.type").alias("geometrytype")
+    )
+
+# Select and clean relevant columns in income_df
+income_df = income_df \
+    .withColumn("Zip Code", trim(lower(col("Zip Code").cast("string")))) \
+    .withColumn(
+        "Estimated Median Income",
+        regexp_replace(col("Estimated Median Income"), "[^0-9.]+", "").cast("double")
+    )
+
+# Perform inner join to match ZCTA10 with Zip Code and find corresponding income
+joined_df = filtered_geojson_df.join(
+    income_df,
+    filtered_geojson_df["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).select(
+    filtered_geojson_df["ZCTA10"],
+    filtered_geojson_df["HOUSING10"],
+    filtered_geojson_df["POP_2010"],
+    filtered_geojson_df["COMM"],
+    income_df["Estimated Median Income"]
+)
+
+# add column with total salary per block
+joined_df = joined_df.withColumn(
+    "Total_Salary_Block",
+    col("Estimated Median Income") * col("HOUSING10")
+)
+
+
+# Aggregate total salary and population by COMM
+community_salary_df = joined_df.groupBy("COMM").agg(
+    _sum("Total_Salary_Block").alias("Total_Salary_Community"),
+    _sum("POP_2010").alias("Total_Pop_Community")
+)
+
+# Calculate average salary per person for each community
+final_community_df = community_salary_df.withColumn(
+    "Avg_Salary_Per_Person",
+    col("Total_Salary_Community") / col("Total_Pop_Community")
+)
+
+# Sort the results by Avg_Salary_Per_Person in descending order
+final_community_df_top = final_community_df.orderBy(
+    col("Avg_Salary_Per_Person").desc()
+)
+
+final_community_df_bot = final_community_df.orderBy(
+    col("Avg_Salary_Per_Person").asc()
+)
+# Collect the top 3 rows as a list of Row objects
+top_3_comms = final_community_df_top.limit(3).collect()
+bot_3_comms = final_community_df_bot.limit(3).collect()
+
+# Extract the COMM values and store them in separate variables
+tcomm1, tcomm2, tcomm3 = [row["COMM"] for row in top_3_comms]
+bcomm1, bcomm2, bcomm3 = [row["COMM"] for row in bot_3_comms]
+
+
+# Load crime data and filter for 2015
+crime_data = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv",
+    header=True,
+    inferSchema=True
+)
+
+# Convert "DATE OCC" to year and filter for 2015
+crime_data_filtered = crime_data.withColumn(
+    "Year", year(to_date(col("DATE OCC"), "MM/dd/yyyy hh:mm:ss a"))
+).filter(col("Year") == 2015)
+
+re_codes = spark.read.csv("s3://initial-notebook-data-bucket-dblab-905418150721/RE_codes.csv",
+                          header=True,
+                          inferSchema=True)
+
+crime_data_filtered = crime_data_filtered.filter(col("LAT").isNotNull() & col("LON").isNotNull())
+
+crime_data_filtered = crime_data_filtered.withColumn(
+    "LocationPoint", ST_Point(col("LON"), col("LAT"))
+)
+
+# Perform spatial join: Check if crime points are within polygons
+spatial_joined_df = crime_data_filtered.join(
+    blocks_df,
+    ST_Contains(col("geometry_polygon"), col("LocationPoint")),
+    "inner"
+)
+
+spatial_joined_df.createOrReplaceTempView("CrimeData")
+querytop = f"SELECT COMM, `Vict Descent` FROM CrimeData  WHERE COMM IN ('{tcomm1}', '{tcomm2}', '{tcomm3}')"
+querybot = f"SELECT COMM, `Vict Descent` FROM CrimeData  WHERE COMM IN ('{bcomm1}', '{bcomm2}', '{bcomm3}')"
+
+df_rich = spark.sql(querytop)
+df_poor = spark.sql(querybot)
+
+# Group by 'Vict Descent' and count occurrences
+df_rich_count = df_rich.groupBy('Vict Descent').count()
+df_poor_count = df_poor.groupBy('Vict Descent').count()
+
+rich = df_rich_count.sort(desc("count")).limit(3)
+final_richest = rich.join(re_codes,
+                          re_codes["Vict Descent"] == rich["Vict Descent"],
+                          "inner").select(re_codes["Vict Descent Full"],
+                                          rich["count"]).sort(desc("count"))
+
+poor = df_poor_count.sort(desc("count")).limit(4)
+final_poorest = poor.join(re_codes,
+                          re_codes["Vict Descent"] == poor["Vict Descent"],
+                          "inner").select(re_codes["Vict Descent Full"],
+                                          poor["count"]).sort(desc("count"))
+
+
+# Show the final result
+final_richest.show()
+final_poorest.show()
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+
+#2x4x8
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, year, to_date, desc, asc, trim, lower, regexp_replace, udf,
+    sum as _sum, expr)
+from pyspark.sql.types import StringType
+from sedona.spark import *
+import time
+
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("3 top victim ethnicities of the poorest and richest communitys")\
+    .config("spark.executor.instances", "2")\
+    .config("spark.executor.cores", "4")\
+    .config("spark.executor.memory", "8g")\
+    .getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# create sedona session
+sedona = SedonaContext.create(spark)
+
+# File paths
+censusblocks = "s3a://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+la_income = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+crime19 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19, header=True, inferSchema=True).select("LAT", "LON")
+
+geojson_df = spark.read.json(censusblocks)
+income_df = spark.read.csv(la_income, header=True, inferSchema=True)
+
+
+blocks_df = sedona.read.format("geojson") \
+    .option("multiLine", "true").load(censusblocks) \
+    .selectExpr("explode(features) as features") \
+    .select("features.*")
+
+# Extract relevant columns and ensure geometry is in WKT format
+blocks_df = blocks_df.select(
+    col("properties.ZCTA10").alias("Block_ZCTA10"),
+    col("geometry").cast("string").alias("geometry"),
+    col("properties.*")
+)
+
+# Convert geometry from WKT using ST_GeomFromText()
+blocks_df = blocks_df.withColumn("geometry_polygon", ST_GeomFromText(col("geometry")))
+
+
+# Filter blocks where city = Los Angeles and select the values we need
+filtered_geojson_df = geojson_df \
+    .filter(
+        (col("properties.CITY") == "Los Angeles") & 
+        (col("properties.HOUSING10").cast("int") > 0) & 
+        (col("properties.POP_2010").cast("int") > 0)
+    ) \
+    .select(
+        trim(lower(col("properties.ZCTA10"))).alias("ZCTA10"),
+        col("properties.HOUSING10").alias("HOUSING10"),
+        col("properties.POP_2010").alias("POP_2010"),
+        col("properties.COMM").alias("COMM"),
+        col("geometry.coordinates").alias("coordinates"),
+        col("geometry.type").alias("geometrytype")
+    )
+
+# Select and clean relevant columns in income_df
+income_df = income_df \
+    .withColumn("Zip Code", trim(lower(col("Zip Code").cast("string")))) \
+    .withColumn(
+        "Estimated Median Income",
+        regexp_replace(col("Estimated Median Income"), "[^0-9.]+", "").cast("double")
+    )
+
+# Perform inner join to match ZCTA10 with Zip Code and find corresponding income
+joined_df = filtered_geojson_df.join(
+    income_df,
+    filtered_geojson_df["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).select(
+    filtered_geojson_df["ZCTA10"],
+    filtered_geojson_df["HOUSING10"],
+    filtered_geojson_df["POP_2010"],
+    filtered_geojson_df["COMM"],
+    income_df["Estimated Median Income"]
+)
+
+# add column with total salary per block
+joined_df = joined_df.withColumn(
+    "Total_Salary_Block",
+    col("Estimated Median Income") * col("HOUSING10")
+)
+
+
+# Aggregate total salary and population by COMM
+community_salary_df = joined_df.groupBy("COMM").agg(
+    _sum("Total_Salary_Block").alias("Total_Salary_Community"),
+    _sum("POP_2010").alias("Total_Pop_Community")
+)
+
+# Calculate average salary per person for each community
+final_community_df = community_salary_df.withColumn(
+    "Avg_Salary_Per_Person",
+    col("Total_Salary_Community") / col("Total_Pop_Community")
+)
+
+# Sort the results by Avg_Salary_Per_Person in descending order
+final_community_df_top = final_community_df.orderBy(
+    col("Avg_Salary_Per_Person").desc()
+)
+
+final_community_df_bot = final_community_df.orderBy(
+    col("Avg_Salary_Per_Person").asc()
+)
+# Collect the top 3 rows as a list of Row objects
+top_3_comms = final_community_df_top.limit(3).collect()
+bot_3_comms = final_community_df_bot.limit(3).collect()
+
+# Extract the COMM values and store them in separate variables
+tcomm1, tcomm2, tcomm3 = [row["COMM"] for row in top_3_comms]
+bcomm1, bcomm2, bcomm3 = [row["COMM"] for row in bot_3_comms]
+
+
+# Load crime data and filter for 2015
+crime_data = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv",
+    header=True,
+    inferSchema=True
+)
+
+# Convert "DATE OCC" to year and filter for 2015
+crime_data_filtered = crime_data.withColumn(
+    "Year", year(to_date(col("DATE OCC"), "MM/dd/yyyy hh:mm:ss a"))
+).filter(col("Year") == 2015)
+
+re_codes = spark.read.csv("s3://initial-notebook-data-bucket-dblab-905418150721/RE_codes.csv",
+                          header=True,
+                          inferSchema=True)
+
+crime_data_filtered = crime_data_filtered.filter(col("LAT").isNotNull() & col("LON").isNotNull())
+
+crime_data_filtered = crime_data_filtered.withColumn(
+    "LocationPoint", ST_Point(col("LON"), col("LAT"))
+)
+
+# Perform spatial join: Check if crime points are within polygons
+spatial_joined_df = crime_data_filtered.join(
+    blocks_df,
+    ST_Contains(col("geometry_polygon"), col("LocationPoint")),
+    "inner"
+)
+
+spatial_joined_df.createOrReplaceTempView("CrimeData")
+querytop = f"SELECT COMM, `Vict Descent` FROM CrimeData  WHERE COMM IN ('{tcomm1}', '{tcomm2}', '{tcomm3}')"
+querybot = f"SELECT COMM, `Vict Descent` FROM CrimeData  WHERE COMM IN ('{bcomm1}', '{bcomm2}', '{bcomm3}')"
+
+df_rich = spark.sql(querytop)
+df_poor = spark.sql(querybot)
+
+# Group by 'Vict Descent' and count occurrences
+df_rich_count = df_rich.groupBy('Vict Descent').count()
+df_poor_count = df_poor.groupBy('Vict Descent').count()
+
+
+rich = df_rich_count.sort(desc("count")).limit(3)
+final_richest = rich.join(re_codes,
+                          re_codes["Vict Descent"] == rich["Vict Descent"],
+                          "inner").select(re_codes["Vict Descent Full"],
+                                          rich["count"]).sort(desc("count"))
+
+poor = df_poor_count.sort(desc("count")).limit(4)
+final_poorest = poor.join(re_codes,
+                          re_codes["Vict Descent"] == poor["Vict Descent"],
+                          "inner").select(re_codes["Vict Descent Full"],
+                                          poor["count"]).sort(desc("count"))
+
+# Show the final result
+final_richest.show()
+final_poorest.show()
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
