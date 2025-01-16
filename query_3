@@ -1,0 +1,616 @@
+#first part
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, trim, lower, regexp_replace, udf, sum as _sum, expr, concat, lit
+)
+from sedona.spark import *
+from sedona.register import SedonaRegistrator
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Average Salary and Crimes Per Person Per Community") \
+    .getOrCreate()
+
+# Create Sedona session
+sedona = SedonaContext.create(spark)
+SedonaRegistrator.registerAll(spark)
+
+start_time = time.time()
+
+# File paths
+censusblocks = "s3a://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+la_income = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+crime19 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crimepresent = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19, header=True, inferSchema=True).select("LAT", "LON")
+crimepresent_df = spark.read.csv(crimepresent, header=True, inferSchema=True).select("LAT", "LON")
+allcrimes_df = crime19_df.union(crimepresent_df)
+geojson_df = spark.read.json(censusblocks)
+income_df = spark.read.csv(la_income, header=True, inferSchema=True)
+
+# Filter blocks where city = Los Angeles and select the values we need
+filtered_geojson_df = geojson_df \
+    .filter(
+        (col("properties.CITY") == "Los Angeles") & 
+        (col("properties.HOUSING10").cast("int") > 0) & 
+        (col("properties.POP_2010").cast("int") > 0)
+    ) \
+    .select(
+        trim(lower(col("properties.ZCTA10"))).alias("ZCTA10"),
+        col("properties.HOUSING10").alias("HOUSING10"),
+        col("properties.POP_2010").alias("POP_2010"),
+        col("properties.COMM").alias("COMM"),
+        col("geometry.coordinates").alias("coordinates"),
+        col("geometry.type").alias("geometrytype")
+    )
+
+# Select and clean relevant columns in income_df
+income_df = income_df \
+    .withColumn("Zip Code", trim(lower(col("Zip Code").cast("string")))) \
+    .withColumn(
+        "Estimated Median Income",
+        regexp_replace(col("Estimated Median Income"), "[^0-9.]+", "").cast("double")
+    )
+
+# Perform inner join to match ZCTA10 with Zip Code and find corresponding income
+joined_df = filtered_geojson_df.join(
+    income_df,
+    filtered_geojson_df["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).select(
+    filtered_geojson_df["ZCTA10"],
+    filtered_geojson_df["HOUSING10"],
+    filtered_geojson_df["POP_2010"],
+    filtered_geojson_df["COMM"],
+    income_df["Estimated Median Income"]
+)
+
+joined_df.explain(True)
+
+# Add column with total salary per block
+joined_df = joined_df.withColumn(
+    "Total_Salary_Block",
+    col("Estimated Median Income") * col("HOUSING10")
+)
+
+# Aggregate total salary and population by COMM
+community_salary_df = joined_df.groupBy("COMM").agg(
+    _sum("Total_Salary_Block").alias("Total_Salary_Community"),
+    _sum("POP_2010").alias("Total_Pop_Community")
+)
+
+# Calculate average salary per person for each community
+community_salary_df = community_salary_df.withColumn(
+    "Avg_Salary_Per_Person",
+    col("Total_Salary_Community") / col("Total_Pop_Community")
+)
+
+# Add a geometry column for crime locations
+crimes_with_geometry_df = allcrimes_df.withColumn(
+    "crime_geom",
+    ST_Point(col("LON"), col("LAT"))  # Longitude first, then latitude
+)
+
+# Construct a valid GeoJSON string
+filtered_geojson_df = filtered_geojson_df.withColumn(
+    "geojson_geometry",
+    concat(
+        lit('{"type":"'),
+        col("geometrytype"),
+        lit('","coordinates":'),
+        expr("CAST(coordinates AS STRING)"),
+        lit('}')
+    )
+)
+
+# Add a geometry column for block polygons
+blocks_with_geometry_df = filtered_geojson_df.withColumn(
+    "block_geom",
+    ST_GeomFromGeoJSON(col("geojson_geometry"))
+)
+
+# Perform spatial join: find which block each crime occurred in
+crimes_in_blocks_df = crimes_with_geometry_df.join(
+    blocks_with_geometry_df,
+    ST_Contains(col("block_geom"), col("crime_geom")),
+    "inner"
+).select(
+    "COMM", "POP_2010"
+)
+
+crimes_in_blocks_df.explain(True)
+
+# Aggregate crimes per community and calculate average crimes per person
+community_crime_df = crimes_in_blocks_df.groupBy("COMM").agg(
+    _sum("POP_2010").alias("Total_Pop_Community"),
+    expr("COUNT(*)").alias("Total_Crimes")
+).withColumn(
+    "Avg_Crimes_Per_Person",
+    col("Total_Crimes") / col("Total_Pop_Community")
+)
+
+# Join salary and crime data
+final_df = community_salary_df.join(
+    community_crime_df,
+    "COMM",
+    "inner"
+).select(
+    "COMM",
+    "Avg_Salary_Per_Person",
+    "Avg_Crimes_Per_Person"
+).orderBy(col("Avg_Salary_Per_Person").desc())
+
+final_df.explain(True)
+
+# Show final result
+final_df.show(truncate=False)
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+
+#--------------------------------------------------------------------
+#part 2
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, trim, lower, regexp_replace, udf, sum as _sum, expr, concat, lit
+)
+from sedona.spark import *
+from sedona.register import SedonaRegistrator
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Average Salary and Crimes Per Person Per Community") \
+    .getOrCreate()
+
+# Create Sedona session
+sedona = SedonaContext.create(spark)
+SedonaRegistrator.registerAll(spark)
+
+start_time = time.time()
+
+# File paths
+censusblocks = "s3a://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+la_income = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+crime19 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crimepresent = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19, header=True, inferSchema=True).select("LAT", "LON")
+crimepresent_df = spark.read.csv(crimepresent, header=True, inferSchema=True).select("LAT", "LON")
+allcrimes_df = crime19_df.union(crimepresent_df)
+geojson_df = spark.read.json(censusblocks)
+income_df = spark.read.csv(la_income, header=True, inferSchema=True)
+
+# Filter blocks where city = Los Angeles and select the values we need
+filtered_geojson_df = geojson_df \
+    .filter(
+        (col("properties.CITY") == "Los Angeles") & 
+        (col("properties.HOUSING10").cast("int") > 0) & 
+        (col("properties.POP_2010").cast("int") > 0)
+    ) \
+    .select(
+        trim(lower(col("properties.ZCTA10"))).alias("ZCTA10"),
+        col("properties.HOUSING10").alias("HOUSING10"),
+        col("properties.POP_2010").alias("POP_2010"),
+        col("properties.COMM").alias("COMM"),
+        col("geometry.coordinates").alias("coordinates"),
+        col("geometry.type").alias("geometrytype")
+    )
+
+# Select and clean relevant columns in income_df
+income_df = income_df \
+    .withColumn("Zip Code", trim(lower(col("Zip Code").cast("string")))) \
+    .withColumn(
+        "Estimated Median Income",
+        regexp_replace(col("Estimated Median Income"), "[^0-9.]+", "").cast("double")
+    )
+hinted_filtered_geojson_df = filtered_geojson_df.hint("shuffle_hash")
+
+# Perform inner join to match ZCTA10 with Zip Code and find corresponding income
+joined_df = hinted_filtered_geojson_df.join(
+    income_df,
+    filtered_geojson_df["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).select(
+    filtered_geojson_df["ZCTA10"],
+    filtered_geojson_df["HOUSING10"],
+    filtered_geojson_df["POP_2010"],
+    filtered_geojson_df["COMM"],
+    income_df["Estimated Median Income"]
+)
+
+joined_df.explain(True)
+
+# Add column with total salary per block
+joined_df = joined_df.withColumn(
+    "Total_Salary_Block",
+    col("Estimated Median Income") * col("HOUSING10")
+)
+
+# Aggregate total salary and population by COMM
+community_salary_df = joined_df.groupBy("COMM").agg(
+    _sum("Total_Salary_Block").alias("Total_Salary_Community"),
+    _sum("POP_2010").alias("Total_Pop_Community")
+)
+
+# Calculate average salary per person for each community
+community_salary_df = community_salary_df.withColumn(
+    "Avg_Salary_Per_Person",
+    col("Total_Salary_Community") / col("Total_Pop_Community")
+)
+
+# Add a geometry column for crime locations
+crimes_with_geometry_df = allcrimes_df.withColumn(
+    "crime_geom",
+    ST_Point(col("LON"), col("LAT"))  # Longitude first, then latitude
+)
+
+# Construct a valid GeoJSON string
+filtered_geojson_df = filtered_geojson_df.withColumn(
+    "geojson_geometry",
+    concat(
+        lit('{"type":"'),
+        col("geometrytype"),
+        lit('","coordinates":'),
+        expr("CAST(coordinates AS STRING)"),
+        lit('}')
+    )
+)
+
+# Add a geometry column for block polygons
+blocks_with_geometry_df = filtered_geojson_df.withColumn(
+    "block_geom",
+    ST_GeomFromGeoJSON(col("geojson_geometry"))
+)
+
+# Perform spatial join: find which block each crime occurred in
+crimes_in_blocks_df = crimes_with_geometry_df.join(
+    blocks_with_geometry_df,
+    ST_Contains(col("block_geom"), col("crime_geom")),
+    "inner"
+).select(
+    "COMM", "POP_2010"
+)
+
+# Aggregate crimes per community and calculate average crimes per person
+community_crime_df = crimes_in_blocks_df.groupBy("COMM").agg(
+    _sum("POP_2010").alias("Total_Pop_Community"),
+    expr("COUNT(*)").alias("Total_Crimes")
+).withColumn(
+    "Avg_Crimes_Per_Person",
+    col("Total_Crimes") / col("Total_Pop_Community")
+)
+
+# Join salary and crime data
+final_df = community_salary_df.join(
+    community_crime_df,
+    "COMM",
+    "inner"
+).select(
+    "COMM",
+    "Avg_Salary_Per_Person",
+    "Avg_Crimes_Per_Person"
+).orderBy(col("Avg_Salary_Per_Person").desc())
+
+
+# Show final result
+final_df.show(truncate=False)
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+#---------------------------------------------------------
+#part 3
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, trim, lower, regexp_replace, udf, sum as _sum, expr, concat, lit
+)
+from sedona.spark import *
+from sedona.register import SedonaRegistrator
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Average Salary and Crimes Per Person Per Community") \
+    .getOrCreate()
+
+# Create Sedona session
+sedona = SedonaContext.create(spark)
+SedonaRegistrator.registerAll(spark)
+
+start_time = time.time()
+
+# File paths
+censusblocks = "s3a://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+la_income = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+crime19 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crimepresent = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19, header=True, inferSchema=True).select("LAT", "LON")
+crimepresent_df = spark.read.csv(crimepresent, header=True, inferSchema=True).select("LAT", "LON")
+allcrimes_df = crime19_df.union(crimepresent_df)
+geojson_df = spark.read.json(censusblocks)
+income_df = spark.read.csv(la_income, header=True, inferSchema=True)
+
+# Filter blocks where city = Los Angeles and select the values we need
+filtered_geojson_df = geojson_df \
+    .filter(
+        (col("properties.CITY") == "Los Angeles") & 
+        (col("properties.HOUSING10").cast("int") > 0) & 
+        (col("properties.POP_2010").cast("int") > 0)
+    ) \
+    .select(
+        trim(lower(col("properties.ZCTA10"))).alias("ZCTA10"),
+        col("properties.HOUSING10").alias("HOUSING10"),
+        col("properties.POP_2010").alias("POP_2010"),
+        col("properties.COMM").alias("COMM"),
+        col("geometry.coordinates").alias("coordinates"),
+        col("geometry.type").alias("geometrytype")
+    )
+
+# Select and clean relevant columns in income_df
+income_df = income_df \
+    .withColumn("Zip Code", trim(lower(col("Zip Code").cast("string")))) \
+    .withColumn(
+        "Estimated Median Income",
+        regexp_replace(col("Estimated Median Income"), "[^0-9.]+", "").cast("double")
+    )
+hinted_filtered_geojson_df = filtered_geojson_df.hint("merge")
+
+# Perform inner join to match ZCTA10 with Zip Code and find corresponding income
+joined_df = hinted_filtered_geojson_df.join(
+    income_df,
+    filtered_geojson_df["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).select(
+    filtered_geojson_df["ZCTA10"],
+    filtered_geojson_df["HOUSING10"],
+    filtered_geojson_df["POP_2010"],
+    filtered_geojson_df["COMM"],
+    income_df["Estimated Median Income"]
+)
+
+joined_df.explain(True)
+
+# Add column with total salary per block
+joined_df = joined_df.withColumn(
+    "Total_Salary_Block",
+    col("Estimated Median Income") * col("HOUSING10")
+)
+
+# Aggregate total salary and population by COMM
+community_salary_df = joined_df.groupBy("COMM").agg(
+    _sum("Total_Salary_Block").alias("Total_Salary_Community"),
+    _sum("POP_2010").alias("Total_Pop_Community")
+)
+
+# Calculate average salary per person for each community
+community_salary_df = community_salary_df.withColumn(
+    "Avg_Salary_Per_Person",
+    col("Total_Salary_Community") / col("Total_Pop_Community")
+)
+
+# Add a geometry column for crime locations
+crimes_with_geometry_df = allcrimes_df.withColumn(
+    "crime_geom",
+    ST_Point(col("LON"), col("LAT"))  # Longitude first, then latitude
+)
+
+# Construct a valid GeoJSON string
+filtered_geojson_df = filtered_geojson_df.withColumn(
+    "geojson_geometry",
+    concat(
+        lit('{"type":"'),
+        col("geometrytype"),
+        lit('","coordinates":'),
+        expr("CAST(coordinates AS STRING)"),
+        lit('}')
+    )
+)
+
+# Add a geometry column for block polygons
+blocks_with_geometry_df = filtered_geojson_df.withColumn(
+    "block_geom",
+    ST_GeomFromGeoJSON(col("geojson_geometry"))
+)
+
+# Perform spatial join: find which block each crime occurred in
+crimes_in_blocks_df = crimes_with_geometry_df.join(
+    blocks_with_geometry_df,
+    ST_Contains(col("block_geom"), col("crime_geom")),
+    "inner"
+).select(
+    "COMM", "POP_2010"
+)
+
+# Aggregate crimes per community and calculate average crimes per person
+community_crime_df = crimes_in_blocks_df.groupBy("COMM").agg(
+    _sum("POP_2010").alias("Total_Pop_Community"),
+    expr("COUNT(*)").alias("Total_Crimes")
+).withColumn(
+    "Avg_Crimes_Per_Person",
+    col("Total_Crimes") / col("Total_Pop_Community")
+)
+
+# Join salary and crime data
+final_df = community_salary_df.join(
+    community_crime_df,
+    "COMM",
+    "inner"
+).select(
+    "COMM",
+    "Avg_Salary_Per_Person",
+    "Avg_Crimes_Per_Person"
+).orderBy(col("Avg_Salary_Per_Person").desc())
+
+
+# Show final result
+final_df.show(truncate=False)
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+
+#------------------------------------------------------------
+part 4
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, trim, lower, regexp_replace, udf, sum as _sum, expr, concat, lit
+)
+from sedona.spark import *
+from sedona.register import SedonaRegistrator
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Average Salary and Crimes Per Person Per Community") \
+    .getOrCreate()
+
+# Create Sedona session
+sedona = SedonaContext.create(spark)
+SedonaRegistrator.registerAll(spark)
+
+start_time = time.time()
+
+# File paths
+censusblocks = "s3a://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+la_income = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+crime19 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crimepresent = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+# Read all files into DataFrames
+crime19_df = spark.read.csv(crime19, header=True, inferSchema=True).select("LAT", "LON")
+crimepresent_df = spark.read.csv(crimepresent, header=True, inferSchema=True).select("LAT", "LON")
+allcrimes_df = crime19_df.union(crimepresent_df)
+geojson_df = spark.read.json(censusblocks)
+income_df = spark.read.csv(la_income, header=True, inferSchema=True)
+
+# Filter blocks where city = Los Angeles and select the values we need
+filtered_geojson_df = geojson_df \
+    .filter(
+        (col("properties.CITY") == "Los Angeles") & 
+        (col("properties.HOUSING10").cast("int") > 0) & 
+        (col("properties.POP_2010").cast("int") > 0)
+    ) \
+    .select(
+        trim(lower(col("properties.ZCTA10"))).alias("ZCTA10"),
+        col("properties.HOUSING10").alias("HOUSING10"),
+        col("properties.POP_2010").alias("POP_2010"),
+        col("properties.COMM").alias("COMM"),
+        col("geometry.coordinates").alias("coordinates"),
+        col("geometry.type").alias("geometrytype")
+    )
+
+# Select and clean relevant columns in income_df
+income_df = income_df \
+    .withColumn("Zip Code", trim(lower(col("Zip Code").cast("string")))) \
+    .withColumn(
+        "Estimated Median Income",
+        regexp_replace(col("Estimated Median Income"), "[^0-9.]+", "").cast("double")
+    )
+hinted_filtered_geojson_df = filtered_geojson_df.hint("shuffle_replicate_nl")
+
+# Perform inner join to match ZCTA10 with Zip Code and find corresponding income
+joined_df = hinted_filtered_geojson_df.join(
+    income_df,
+    filtered_geojson_df["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).select(
+    filtered_geojson_df["ZCTA10"],
+    filtered_geojson_df["HOUSING10"],
+    filtered_geojson_df["POP_2010"],
+    filtered_geojson_df["COMM"],
+    income_df["Estimated Median Income"]
+)
+
+joined_df.explain(True)
+
+# Add column with total salary per block
+joined_df = joined_df.withColumn(
+    "Total_Salary_Block",
+    col("Estimated Median Income") * col("HOUSING10")
+)
+
+# Aggregate total salary and population by COMM
+community_salary_df = joined_df.groupBy("COMM").agg(
+    _sum("Total_Salary_Block").alias("Total_Salary_Community"),
+    _sum("POP_2010").alias("Total_Pop_Community")
+)
+
+# Calculate average salary per person for each community
+community_salary_df = community_salary_df.withColumn(
+    "Avg_Salary_Per_Person",
+    col("Total_Salary_Community") / col("Total_Pop_Community")
+)
+
+# Add a geometry column for crime locations
+crimes_with_geometry_df = allcrimes_df.withColumn(
+    "crime_geom",
+    ST_Point(col("LON"), col("LAT"))  # Longitude first, then latitude
+)
+
+# Construct a valid GeoJSON string
+filtered_geojson_df = filtered_geojson_df.withColumn(
+    "geojson_geometry",
+    concat(
+        lit('{"type":"'),
+        col("geometrytype"),
+        lit('","coordinates":'),
+        expr("CAST(coordinates AS STRING)"),
+        lit('}')
+    )
+)
+
+# Add a geometry column for block polygons
+blocks_with_geometry_df = filtered_geojson_df.withColumn(
+    "block_geom",
+    ST_GeomFromGeoJSON(col("geojson_geometry"))
+)
+
+# Perform spatial join: find which block each crime occurred in
+crimes_in_blocks_df = crimes_with_geometry_df.join(
+    blocks_with_geometry_df,
+    ST_Contains(col("block_geom"), col("crime_geom")),
+    "inner"
+).select(
+    "COMM", "POP_2010"
+)
+
+# Aggregate crimes per community and calculate average crimes per person
+community_crime_df = crimes_in_blocks_df.groupBy("COMM").agg(
+    _sum("POP_2010").alias("Total_Pop_Community"),
+    expr("COUNT(*)").alias("Total_Crimes")
+).withColumn(
+    "Avg_Crimes_Per_Person",
+    col("Total_Crimes") / col("Total_Pop_Community")
+)
+
+# Join salary and crime data
+final_df = community_salary_df.join(
+    community_crime_df,
+    "COMM",
+    "inner"
+).select(
+    "COMM",
+    "Avg_Salary_Per_Person",
+    "Avg_Crimes_Per_Person"
+).orderBy(col("Avg_Salary_Per_Person").desc())
+
+
+# Show final result
+final_df.show(truncate=False)
+
+# Stop timing and print out the execution duration
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
