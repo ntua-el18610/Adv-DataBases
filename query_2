@@ -1,0 +1,299 @@
+#part 1
+
+from pyspark.sql import SparkSession
+import time
+from pyspark.sql.functions import col, when, count, trim, year, to_date, desc
+from pyspark.sql.window import Window
+from pyspark.sql.functions import dense_rank
+
+# Initialize SparkSession
+spark = SparkSession.builder.appName("Crime Analysis by Area").getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# Load the data into DataFrames
+df_victims19 = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv",
+    header=True,
+    inferSchema=True,
+    multiLine=True,
+    quote='"',
+    escape='"'
+)
+df_victims_current = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv",
+    header=True,
+    inferSchema=True,
+    multiLine=True,
+    quote='"',
+    escape='"'
+)
+
+# Combine the two datasets
+df_all_victims = df_victims19.union(df_victims_current)
+
+# Trim all column names to handle trailing spaces
+df_all_victims = df_all_victims.select([col(c).alias(c.strip()) for c in df_all_victims.columns])
+
+# Ensure the "AREA" column is treated as an integer (if necessary)
+df_all_victims = df_all_victims.withColumn("AREA NAME", trim(col("AREA NAME")).cast("string"))
+
+# Filter valid rows (ensure AREA is not null)
+df_all_victims = df_all_victims.filter(col("AREA NAME").isNotNull())
+
+# Convert "DATE OCC" to date format and extract the year
+df_all_victims = df_all_victims.withColumn(
+    "Year",
+    year(to_date(col("DATE OCC"), "MM/dd/yyyy hh:mm:ss a"))
+)
+
+# Calculate percentage for each area
+result = (
+    df_all_victims.groupBy("AREA NAME", "Year")
+    .agg(
+        count("*").alias("Total_Count"),
+        count(when(~col("Status Desc").isin("UNK", "Invest Cont"), 1)).alias("Valid_Count")
+    )
+    .withColumn("Percentage", (col("Valid_Count") / col("Total_Count")) * 100)
+)
+
+# Define a window specification for ranking within each year
+window_spec = Window.partitionBy("Year").orderBy(desc("Percentage"))
+
+# Add ranking column
+ranked_result = result.withColumn("Ranking", dense_rank().over(window_spec))
+
+# Filter top 3 areas per year
+top_3_per_year = ranked_result.filter(col("Ranking") <= 3)
+
+# Select and order the final result
+final_result = top_3_per_year.select("Year", "AREA NAME", "Percentage", "Ranking").orderBy("Year", "Ranking")
+
+# Show the results
+final_result.show(truncate=False)
+
+# Stop timing and print execution time
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+#---------------------------------------------------------------
+part 2
+
+from pyspark.sql import SparkSession
+import time
+from pyspark.sql.functions import col, trim
+
+# Initialize SparkSession
+spark = SparkSession.builder.appName("Crime Analysis by Area with SQL").getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# Load the data into DataFrames
+df_victims19 = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv",
+    header=True,
+    inferSchema=True,
+    multiLine=True,
+    quote='"',
+    escape='"'
+)
+df_victims_current = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv",
+    header=True,
+    inferSchema=True,
+    multiLine=True,
+    quote='"',
+    escape='"'
+)
+
+# Combine the two datasets
+df_all_victims = df_victims19.union(df_victims_current)
+
+# Trim all column names to handle trailing spaces
+df_all_victims = df_all_victims.select([col(c).alias(c.strip()) for c in df_all_victims.columns])
+
+# Ensure the "AREA" column is treated as an integer (if necessary)
+df_all_victims = df_all_victims.withColumn("AREA", trim(col("AREA")).cast("int"))
+
+# Filter valid rows (ensure AREA is not null)
+df_all_victims = df_all_victims.filter(col("AREA").isNotNull())
+
+# Register the DataFrame as a temporary SQL view
+df_all_victims.createOrReplaceTempView("CrimeData")
+
+# SQL query with corrected date extraction
+query = """
+    WITH RankedData AS (
+        SELECT 
+            YEAR(TO_DATE(`Date Rptd`, 'MM/dd/yyyy hh:mm:ss a')) AS Year,
+            `AREA NAME` AS Area_Name,
+            (SUM(CASE WHEN UPPER(`Status Desc`) NOT IN ('UNK', 'INVEST CONT') THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) AS Percentage,
+            DENSE_RANK() OVER (PARTITION BY YEAR(TO_DATE(`Date Rptd`, 'MM/dd/yyyy hh:mm:ss a')) ORDER BY 
+                (SUM(CASE WHEN UPPER(`Status Desc`) NOT IN ('UNK', 'INVEST CONT') THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) DESC) AS Ranking
+        FROM 
+            CrimeData
+        GROUP BY 
+            YEAR(TO_DATE(`Date Rptd`, 'MM/dd/yyyy hh:mm:ss a')), `AREA NAME`
+    )
+    SELECT 
+        Year, Area_Name, Percentage, Ranking
+    FROM 
+        RankedData
+    WHERE 
+        Ranking <= 3
+    ORDER BY 
+        Year, Ranking
+"""
+
+# Execute the SQL query
+result = spark.sql(query)
+
+# Show the results
+result.show(truncate=False)
+
+# Stop timing and print execution time
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+
+#---------------------------------------------------
+#part 3
+
+from pyspark.sql import SparkSession
+import time
+from pyspark.sql.functions import col, when, count, trim, year, to_date
+
+# Initialize SparkSession
+spark = SparkSession.builder.appName("Crime Analysis by Area with SQL").getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+# Load the data into DataFrames
+df_victims19 = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv",
+    header=True,
+    inferSchema=True,
+    multiLine=True,
+    quote='"',
+    escape='"'
+)
+df_victims_current = spark.read.csv(
+    "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv",
+    header=True,
+    inferSchema=True,
+    multiLine=True,
+    quote='"',
+    escape='"'
+)
+
+# Combine the two datasets
+df_all_victims = df_victims19.union(df_victims_current)
+
+# Trim all column names to handle trailing spaces
+df_all_victims = df_all_victims.select([col(c).alias(c.strip()) for c in df_all_victims.columns])
+
+# Ensure the "AREA" column is treated as an integer (if necessary)
+df_all_victims = df_all_victims.withColumn("AREA", trim(col("AREA")).cast("int"))
+
+# Filter valid rows (ensure AREA is not null)
+df_all_victims = df_all_victims.filter(col("AREA").isNotNull())
+
+# Register the DataFrame as a temporary SQL view
+df_all_victims.createOrReplaceTempView("CrimeData")
+
+# Execute the SQL query
+result = spark.sql(query)
+
+# Αποθήκευση σε Parquet μέσω SQL
+spark.sql("""
+    SELECT * FROM CrimeData
+""").write.mode("overwrite").parquet("s3://groups-bucket-dblab-905418150721/group18/q2/converted.parquet")
+
+# Χρόνος εκτέλεσης
+sql_start_time = time.time()
+
+# Ανάγνωση από Parquet μέσω SQL
+parquet_data_sql = spark.read.parquet("s3://groups-bucket-dblab-905418150721/group18/q2/converted.parquet")
+parquet_data_sql.createOrReplaceTempView("ParquetData")
+
+spark.sql("""
+    SELECT COUNT(*) FROM ParquetData
+""").show()
+
+sql_end_time = time.time()
+sql_duration = sql_end_time - sql_start_time
+
+print(f"SQL processing time: {sql_duration:.2f} seconds")
+
+#--------------------------------------------------------------------
+#part 4
+
+from pyspark.sql import SparkSession
+import time
+from pyspark.sql.functions import col, trim
+
+# Initialize SparkSession
+spark = SparkSession.builder.appName("Crime Analysis by Area with SQL").getOrCreate()
+
+# Start timing
+start_time = time.time()
+
+df_victims_1 = spark.read.parquet("s3://groups-bucket-dblab-905418150721/group18/q2/converted.parquet/part-00000-27e4dfc8-6ccb-4290-82ab-bbe5c9821eb9-c000.snappy.parquet")
+df_victims_2 = spark.read.parquet("s3://groups-bucket-dblab-905418150721/group18/q2/converted.parquet/part-00001-27e4dfc8-6ccb-4290-82ab-bbe5c9821eb9-c000.snappy.parquet")
+df_all_victims = df_victims_1.union(df_victims_2)
+
+
+# Combine the two datasets
+df_all_victims = df_victims19.union(df_victims_current)
+
+# Trim all column names to handle trailing spaces
+df_all_victims = df_all_victims.select([col(c).alias(c.strip()) for c in df_all_victims.columns])
+
+# Ensure the "AREA" column is treated as an integer (if necessary)
+df_all_victims = df_all_victims.withColumn("AREA", trim(col("AREA")).cast("int"))
+
+# Filter valid rows (ensure AREA is not null)
+df_all_victims = df_all_victims.filter(col("AREA").isNotNull())
+
+# Register the DataFrame as a temporary SQL view
+df_all_victims.createOrReplaceTempView("CrimeData")
+
+# SQL query with corrected date extraction
+query = """
+    WITH RankedData AS (
+        SELECT 
+            YEAR(TO_DATE(`Date Rptd`, 'MM/dd/yyyy hh:mm:ss a')) AS Year,
+            `AREA NAME` AS Area_Name,
+            (SUM(CASE WHEN UPPER(`Status Desc`) NOT IN ('UNK', 'INVEST CONT') THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) AS Percentage,
+            DENSE_RANK() OVER (PARTITION BY YEAR(TO_DATE(`Date Rptd`, 'MM/dd/yyyy hh:mm:ss a')) ORDER BY 
+                (SUM(CASE WHEN UPPER(`Status Desc`) NOT IN ('UNK', 'INVEST CONT') THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) DESC) AS Ranking
+        FROM 
+            CrimeData
+        GROUP BY 
+            YEAR(TO_DATE(`Date Rptd`, 'MM/dd/yyyy hh:mm:ss a')), `AREA NAME`
+    )
+    SELECT 
+        Year, Area_Name, Percentage, Ranking
+    FROM 
+        RankedData
+    WHERE 
+        Ranking <= 3
+    ORDER BY 
+        Year, Ranking
+"""
+
+# Execute the SQL query
+result = spark.sql(query)
+
+# Show the results
+result.show(truncate=False)
+
+# Stop timing and print execution time
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time:.2f} seconds")
+
+
